@@ -193,7 +193,8 @@ def make_wkv7_checkpoint(B: int, T: int, H: int, D: int = HEAD_SIZE):
         r, w, k, v, a, b, h_in = primals
         d_out, d_h_out, _, _ = cotangents
         _, _, sa_fwd, h_ckpts = outputs
-        mx.eval(h_ckpts, sa_fwd, d_out, d_h_out)
+        # mx.eval убран — Metal kernel принимает lazy tensors,
+        # mx.compile запрещает eval внутри трансформаций
         res = _get_ckpt_bwd(H, T)(
             inputs=[x.astype(mx.float32) for x in [r, w, k, v, a, b, h_ckpts, sa_fwd, d_out, d_h_out]],
             grid=(B*H*D, 1, 1), threadgroup=(D, 1, 1),

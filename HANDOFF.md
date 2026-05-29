@@ -316,3 +316,116 @@ n_embd=768/1024, n_layer=12/24, ctx=4096.
 - **step 83100:** loss 4.9891, 3666 tok/s (v2, ctx=512, b=4, fp32)
 - **step 133200:** loss 4.8482, 4575 tok/s (checkpoint, ctx=256, b=11, fp32)
 - **текущий конфиг:** ctx=1024, b=2, bf16, ~5000 tok/s, ~10.3 GB
+
+---
+
+## mx.compile интеграция (29 мая 2026)
+
+### Что сделано
+
+**Убран `mx.eval` из VJP** `wkv7_checkpoint.py`:
+```python
+# Было:
+mx.eval(h_ckpts, sa_fwd, d_out, d_h_out)  # запрещено внутри compile
+res = _get_ckpt_bwd(H, T)(...)
+# Стало:
+res = _get_ckpt_bwd(H, T)(...)  # Metal kernel сам материализует lazy inputs
+```
+
+**`train_step` заменён на `make_train_step(model, optimizer)`**:
+```python
+def make_train_step(model, optimizer):
+    state = [model.state, optimizer.state]
+    def _step(x, y):
+        loss, grads = mx.value_and_grad(loss_fn)(model, x, y)
+        grads, norm = optim.clip_grad_norm(grads, max_norm=1.0)
+        optimizer.update(model, grads)
+        return loss, norm
+    return mx.compile(_step, inputs=state, outputs=state)
+```
+
+`mx.eval(model.state, optimizer.state)` убран из шага — `compile` управляет state сам.
+Утечки памяти нет: `inputs/outputs=state` гарантирует правильное обновление весов.
+
+### Результаты
+
+```
+normal (checkpoint + bf16):   6044 tok/s
+compiled (checkpoint + bf16): 6773 tok/s
+Ускорение: 1.12×   Корректность: loss diff = 0.0000 ✓
+```
+
+### Полная эволюция скорости
+
+| Версия | tok/s | Что добавлено |
+|--------|-------|---------------|
+| Python chunked, fp32 | ~900 | исходное |
+| v2 Metal backward, fp32 | 3 666 | Metal backward |
+| checkpoint kernel, fp32 | 4 500-5 000 | нет Python-loop |
+| checkpoint + bf16 | 5 800-6 050 | bf16 модель |
+| **checkpoint + bf16 + compile** | **~6 750** | **mx.compile** |
+
+**Итоговое ускорение vs Python: ~7.5×**
+
+### Текущая конфигурация production
+
+```python
+# config.py
+"debug": ctx_len=1024, batch_size=4
+
+# train.py  
+MODEL_DTYPE = mx.bfloat16
+train_step  = make_train_step(model, optimizer)  # mx.compile
+```
+
+Скорость: **~6750 tok/s**, RAM: **~10 GB**, контекст: **1024 токена**.
+
+
+---
+
+## Xcode Instruments профилирование (29 мая 2026)
+
+### Metal System Trace — результаты
+
+**GPU утилизация Python-процесса: 77.8%** (45.14s из 58.01s)
+Compute dispatches: 6,744 за 58с = ~116/с = ~70 dispatch/step (нормально для 6-слойной модели)
+
+**Критическая метрика: CPU→GPU latency = 80.72ms**
+Среднее время от CPU-команды до начала GPU-исполнения.
+Это означает что GPU периодически "простаивает" ожидая следующую порцию работы от CPU.
+Несмотря на mx.compile, Python-overhead между dispatch'ами ещё присутствует.
+
+**GPU Performance State: преимущественно P2 (средняя частота)**
+GPU снижает частоту в паузах между dispatch'ами — прямое следствие высокой latency.
+
+### Распределение работы (из Allocations/Time Profiler)
+
+| Операция | % | Вывод |
+|---|---|---|
+| Compiled (mx.compile fused) | 23.7% | наши fused операции |
+| **Matmul** | **21.9%** | **проекции r/k/v/o, FFN, head** |
+| Softmax | 10.4% | cross-entropy fwd+bwd |
+| **CustomKernel (WKV!)** | **4.4%** | наш wkv7_ckpt kernel |
+| LayerNorm + VJP | 3.2% | нормализации |
+
+### Ключевые выводы
+
+1. **WKV = 4.4% работы** — дальнейшая оптимизация WKV kernel даст <5% прироста.
+   Все усилия на WKV уже окупились, дальше не стоит.
+
+2. **Matmul = 21.9%** — это проекции r/k/v/o (4×D²×6слоёв), FFN (D→4D→D×6слоёв),
+   head (D→32000). Для ускорения нужен либо более быстрый GEMM (невозможно без Apple MPS),
+   либо уменьшение числа операций (квантование, structured pruning).
+
+3. **CPU→GPU latency 80ms** — основная проблема. GPU ждёт CPU.
+   Причина: mx.compile не устранил все Python-overhead, dispatch-loop ещё есть.
+   Решение: увеличить batch (больше работы на каждый dispatch) или дальнейший compile.
+
+4. **P2 вместо P1 GPU state** — следствие пункта 3. При постоянной нагрузке GPU
+   поднялся бы до P1 (максимум). Пауза → снижение тактовой.
+
+### Следующий шаг для снижения latency
+Увеличить batch_size: больше токенов → больше работы на один GPU dispatch →
+GPU держит P1 → меньше латентность → выше throughput.
+Проверить: ctx=1024 batch=5 bf16 (оценка ~13GB, вблизи лимита).
+

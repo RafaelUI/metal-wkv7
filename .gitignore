@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Временные тесты и эксперименты (если не нужны в репо)
+# test_*.py  ← раскомментируй если хочешь скрыть тесты
+
+# Jupyter
+*.ipynb_checkpoints
