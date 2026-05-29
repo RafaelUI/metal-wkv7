@@ -1,5 +1,5 @@
-# HANDOFF — RWKV-7 Metal backward на Apple Silicon / MLX
-_Последнее обновление: 29 мая 2026 — полный цикл оптимизации завершён_
+# HANDOFF — RWKV-7 Metal Training на Apple Silicon / MLX
+_Последнее обновление: 29 мая 2026 — полный цикл оптимизации + inference_
 
 ---
 
@@ -10,47 +10,48 @@ _Последнее обновление: 29 мая 2026 — полный цик
 
 ```bash
 # GPU wired limit (сбрасывается при перезагрузке):
-sudo sysctl iogpu.wired_limit_mb=14336   # 14 GB вместо 12 GB по умолчанию
-# Для ctx=4096: обязательно! Для ctx≤2048: желательно.
+sudo sysctl iogpu.wired_limit_mb=14336
+# Постоянно: добавить в /etc/sysctl.conf
 ```
 
 ---
 
-## Структура проектов
+## Структура проекта (production)
 
 ```
 ~/Develop/
-├── rwkv-mlx/                    ← PRODUCTION: обучение модели
+├── rwkv-mlx/                    ← PRODUCTION: обучение с нуля
 │   ├── train.py                 ← точка входа
 │   ├── config.py                ← конфиги моделей
 │   ├── model/
 │   │   ├── rwkv7.py             ← архитектура RWKV-7
 │   │   ├── wkv7.py              ← WKV forward/backward/inference
-│   │   └── wkv7_checkpoint.py  ← checkpoint kernel (ТЕКУЩИЙ backward)
-│   ├── data/                    ← датасеты .bin
-│   └── checkpoints/             ← сохранения
+│   │   └── wkv7_checkpoint.py  ← checkpoint Metal kernel (production)
+│   ├── data/                    ← датасеты .bin (gitignored)
+│   └── checkpoints/             ← сохранения (gitignored)
 │
-└── metal-wkv7/                  ← R&D: разработка и тесты
-    ├── wkv7_train_metal.py      ← v2 chunked (baseline, архив)
-    ├── wkv7_checkpoint.py       ← checkpoint kernel (ТЕКУЩИЙ)
-    ├── wkv7_simd.py             ← эксперимент simd_sum (медленнее)
-    ├── wkv7_bwd_v3.py           ← эксперимент bank padding (медленнее)
-    ├── wkv7_custom.py           ← Python reference (эталон для тестов)
-    ├── wkv7_metal.py            ← inference only
-    ├── test_train_metal.py      ← основной тест v2
-    └── HANDOFF.md               ← этот файл
+└── metal-wkv7/                  ← R&D: kernel разработка
+    ├── wkv7_checkpoint.py       ← основной kernel
+    ├── wkv7_custom.py           ← Python reference
+    ├── wkv7_metal.py            ← inference kernel
+    ├── test_full.py             ← тесты
+    ├── test_isolate.py
+    └── experiments/             ← провальные эксперименты (simd, v3)
 ```
 
 ---
 
-## Текущая конфигурация обучения
+## Текущий конфиг обучения
 
 ```python
 # config.py
-"debug": ctx_len=1024, batch_size=2   # ← ТЕКУЩИЙ
+"debug": RWKVConfig(n_layer=6, n_embd=384, vocab_size=32000, ctx_len=1024, batch_size=4)
 
 # train.py
-MODEL_DTYPE = mx.bfloat16   # bf16 веса: +5-10% скорость, -12% RAM
+CFG_NAME    = "debug"
+MODEL_DTYPE = mx.bfloat16
+GRAD_ACCUM  = 1          # для debug: 1 (нет аккумуляции)
+                          # для 138.9M: 4 (b=4 ctx=512)
 ```
 
 **Запуск:**
@@ -62,485 +63,350 @@ sudo sysctl iogpu.wired_limit_mb=14336
 
 ---
 
-## Исправленные баги
+## История всех оптимизаций (хронологически)
 
-### 1. Утечка памяти → 20 GB своп (критический)
-**Симптом:** после ~83000 шагов скрипт занимал 20 GB → агрессивный своп.
-**Причина:** `optimizer.update(model, grads)` создаёт lazy-тензоры весов. Без eval
-граф накапливается: `w_N → w_{N-1} → ... → w_0`. 83000 шагов → 20 GB.
-**Фикс** в `train.py train_step()`:
+### 1. Исправление утечки памяти → 20 GB своп
+**Симптом:** step 83100, скрипт занимал 20 GB после длительного обучения.
+**Причина:** `optimizer.update()` создаёт lazy-тензоры без материализации.
+За 83000 шагов: `w_N → w_{N-1} → ... → w_0` — цепочка в 20 GB.
+**Фикс:**
 ```python
 optimizer.update(model, grads)
-mx.eval(model.state, optimizer.state)  # ← КРИТИЧНО, разрывает граф
+mx.eval(model.state, optimizer.state)  # ← разрывает lazy граф
 ```
 
-### 2. bf16 backward crash (котангент dtype mismatch)
-**Симптом:** `ValueError: Type of cotangents does not match primal output type`
-**Причина:** Metal VJP возвращал float32 градиенты для bf16 прималов.
-**Фикс** в `wkv7_checkpoint.py`:
-```python
-grads = [res[0..6]]
-return [g.astype(p.dtype) for g, p in zip(grads, primals)]  # cast к dtype примала
-```
-И в `loss_fn`:
-```python
-return model.loss(x, y).astype(mx.float32)  # котангент всегда fp32
-```
+### 2. Metal WKV7 v2 (chunked backward)
 
----
+Python einsum → CUDA-style chunked Metal kernel.
+- Реализован `torch.autograd.Function`-аналог через `mx.custom_function`
+- VJP считает все 6 градиентов (dr, dw, dk, dv, da, db)
+- 16 Python-итераций по CHUNK=32 токенов
+- Результат: **3 666 tok/s** (+4.1× vs Python ~900)
 
-## Архитектура WKV kernel (итоговая версия)
+### 3. Metal WKV7 Checkpoint Kernel (основное ускорение)
 
-### Checkpoint kernel — `wkv7_checkpoint.py`
+**Идея:** заменить 16 Python VJP-вызовов на 2 Metal-вызова для всего T.
 
-**Идея:** вместо 16 Python-итераций + 16 mx.eval — ДВА Metal-вызова на весь T.
-
-```
-Forward kernel  (один вызов, T токенов):
-  for c in 0..N_CHUNKS:
-    for t in 0..CHUNK:
-      compute forward
-    h_checkpoints[c] = h_row   ← сохраняем h после каждых 32 токенов
-
-Backward kernel (один вызов, T токенов):
-  C_row = d_h_out
-  for c in N_CHUNKS-1..0:
-    h_row = h_checkpoints[c]   ← загружаем checkpoint (избегаем взрыв /w)
-    for t in CHUNK-1..0:
-      ... вычисляем dr,dw,dk,dv,da,db ... (12 барьеров, как v2)
+**Forward** (один kernel, T токенов):
+```metal
+for (uint c=0; c<N_CHUNKS; c++) {
+    for (uint t=0; t<CHUNK; t++) { /* WKV step */ }
+    h_checkpoints[c] = h_row;  // ← сохраняем h каждые 32 токена
+}
 ```
 
-**Почему checkpoint необходим для backward:**
-Реконструкция `h_prev = (h_cur - v*k - sa*b) / w` усиливает ошибку в (1/w)^steps раз.
-При CHUNK=512: (1/0.9)^512 ≈ 10^23 → взрыв. При CHUNK=32: (1/0.9)^32 ≈ 30× → допустимо.
+**Backward** (один kernel, обратный порядок):
+```metal
+for (int c=N_CHUNKS-1; c>=0; c--) {
+    h_row = h_checkpoints[c];  // ← загружаем точный checkpoint
+    for (int t=CHUNK-1; t>=0; t--) { /* VJP step */ }
+}
+```
 
-**Математика VJP (на каждый timestep, обратный порядок):**
-```
-C[dv,dk]  += dy[dv] * r[dk]           # накопление котангента
-dv[dv]     = Σ_dk C[dv,dk] * k[dk]   # локально
-dsa[dv]    = Σ_dk C[dv,dk] * b[dk]   # локально
-dr[dk]     = Σ_dv dy[dv]   * h_cur[dv,dk]   # column sum → shared mem
-dw[dk]     = Σ_dv C[dv,dk] * h_prev[dv,dk]  # column sum
-dk[dk]     = Σ_dv C[dv,dk] * v[dv]          # column sum
-da[dk]     = Σ_dv dsa[dv]  * h_prev[dv,dk]  # column sum
-db[dk]     = Σ_dv sa[dv]   * C[dv,dk]       # column sum
-h_prev     = (h_cur - v*k - sa*b) / w       # реконструкция
-C_prev     = C * w + dsa * a                # обновление C
-```
+**Зачем checkpoint:** реконструкция `h_prev = (h_cur - ...) / w` усиливает ошибку в
+`(1/w)^steps`. При CHUNK=512: `(1/0.9)^512 ≈ 10^23` → взрыв. При CHUNK=32: ×30 → OK.
 
 **Технические детали:**
 - `grid=(B*H*D, 1, 1)`, `threadgroup=(D=64, 1, 1)`
-- `accum[D][D]` = 16 KB threadgroup shared memory для column-sum
-- 12 `threadgroup_barrier` на timestep (как в v2, нейтральный рефактор)
-- VJP: `mx.eval(h_ckpts, sa_fwd, d_out, d_h_out)` — единственный GPU sync
+- `accum[D][D]` = 16 KB shared memory для column-sum транспонирования
+- 12 `threadgroup_barrier` на timestep (неизбежно для корректности)
+- Единственный `mx.eval` в VJP → 1 GPU sync vs 32 в v2
+
+**Корректность vs Python:** max diff < 2.5e-5 ✓
+**Численная точность:** checkpoint точнее v2 для некоторых seed (v2 имеет
+data-dependent ошибки 0.3-0.85 из-за накопления в float32 при 16 независимых VJP)
+
+**Результат:** **5 000 tok/s** (+1.73× vs v2)
+
+### 4. bf16 обучение
+
+**Проблема:** VJP возвращал fp32 градиенты для bf16 прималов → crash.
+**Фикс:**
+```python
+# wkv7_checkpoint.py VJP:
+grads = [res[0]..res[6]]
+return [g.astype(p.dtype) for g, p in zip(grads, primals)]  # ← dtype cast
+
+# train.py:
+return model.loss(x, y).astype(mx.float32)  # ← котангент всегда fp32
+```
+
+**Результат:** **~6 050 tok/s** (+12%), -12% RAM, checkpoint files вдвое меньше
+(MLX save_weights сохраняет в dtype модели → bf16 auto)
+
+### 5. mx.compile
+
+**Проблема:** `mx.eval` внутри VJP запрещён в контексте compile.
+**Фикс:** убрать `mx.eval(h_ckpts, sa_fwd, d_out, d_h_out)` из VJP — Metal kernel
+принимает lazy tensors и материализует их сам при dispatch.
+
+**Реализация:**
+```python
+def make_train_step(model, optimizer, grad_accum=1):
+    if grad_accum == 1:
+        state = [model.state, optimizer.state]
+        def _step(x, y):
+            loss, grads = mx.value_and_grad(loss_fn)(model, x, y)
+            grads, norm = optim.clip_grad_norm(grads, max_norm=1.0)
+            optimizer.update(model, grads)
+            return loss, norm
+        return mx.compile(_step, inputs=state, outputs=state)
+    # ... (accum path ниже)
+```
+
+**Почему compile экономит память:** kernel fusion убирает промежуточные тензоры.
+Без compile: каждая операция (layernorm, sigmoid, lerp...) = отдельный тензор в RAM.
+С compile: все element-wise операции сливаются в один Metal kernel → промежуточные
+значения живут только в регистрах GPU.
+
+**Результат:**
+- Скорость: **+12%** (6 050 → 6 720 tok/s при batch=4)
+- Память: **-2.8×** на батч (2.625 GB → 0.95 GB/batch item)
+- Это разблокировало batch=12 (был batch=4): **6 978 tok/s**
+
+### 6. Gradient Accumulation
+
+**Для 138.9M модели:** без аккумуляции batch=4 ctx=512 → OOM.
+С аккумуляцией: N микро-шагов, один optimizer update.
+
+**Критический баг (при реализации):**
+```python
+# НЕПРАВИЛЬНО — 28 GB взрыв:
+total_grads = tree_map(lambda a,b: a+b, total_grads, grads_i)
+# lazy граф: g1 + g2 + g3 + g4 → держится в памяти всё дерево
+
+# ПРАВИЛЬНО:
+mx.eval(grads_i)        # ← материализуем до сложения
+total_grads = tree_map(lambda a,b: a+b, total_grads, grads_i)
+mx.eval(total_grads)    # ← материализуем накопленное
+```
+
+**compiled_micro:** каждый микро-шаг компилируется отдельно:
+```python
+micro_state = [model.state]  # веса не меняются между микро-шагами
+def _micro_fn(x, y):
+    return mx.value_and_grad(loss_fn)(model, x, y)
+compiled_micro = mx.compile(_micro_fn, inputs=micro_state)
+```
 
 ---
 
-## Полная история экспериментов
+## Полная таблица скоростей
 
-### Хронология backward kernel
+| Версия | tok/s | Что добавлено |
+|--------|-------|---------------|
+| Python einsum | ~900 | исходное |
+| Metal v2 chunked | 3 666 | Metal VJP |
+| Checkpoint kernel | ~5 000 | 2 вызова на T |
+| + bf16 | ~6 050 | dtype cast fix |
+| + mx.compile | 6 720 | kernel fusion |
+| + **batch=12** | **6 978** | compile → -2.8× RAM |
+| **Итого: 7.8× vs Python** | | |
 
-| Версия | Ключевое изменение | Медиана tok/s | vs v2 | Итог |
-|--------|-------------------|---------------|-------|------|
-| v2 (baseline) | accum[D][D], 12 барьеров/ts, 16 Python VJP | 18 348 | — | ✅ Baseline |
-| simd_sum | simd_sum(), 2 барьера/ts | 17 054 | 0.93× | ❌ Медленнее |
-| bank padding | accum[D][D+1] + убраны self-shared | 17 083 | 0.93× | ❌ Медленнее |
-| **checkpoint** | 2 Metal-вызова на T, h-checkpoints | **31 000+** | **1.73×** | ✅ PRODUCTION |
+---
 
-> Замеры: B=2, T=32, H=4, D=64, all-6-grads, медиана 40 итераций.
+## Бенчмарки по конфигам (checkpoint + bf16 + compile)
 
-**Почему simd_sum медленнее:** 5×64 = 320 последовательных `simd_sum` на timestep = 1280 циклов.
-Экономия барьеров не компенсирует.
+### debug 36.4M
 
-**Почему bank padding медленнее:** Apple GPU использует иную организацию threadgroup памяти
-чем NVIDIA. Паддинг `[D+1]` нарушает выравнивание вместо устранения конфликтов.
+| ctx | batch | dtype | tok/s | RAM |
+|-----|-------|-------|-------|-----|
+| 512 | 4 | fp32 | 5295 | 11.8G |
+| **1024** | **4** | **bf16** | **~6000** | **10.5G** ← production |
+| 2048 | 1 | bf16 | 3941 | 10.4G |
+| 4096 | 1 | bf16 | 4073 | 15.3G ⚠️ |
 
-**Checkpoint точнее v2:** v2 имеет data-dependent ошибки 0.3-0.85 для некоторых seed.
-Checkpoint стабильно < 3e-5 vs Python reference. Объяснение неизвестно — предположительно
-floating point non-commutativity при 16 независимых VJP-вызовах в v2.
+ctx=512, 1024, 2048 имеют одинаковую память при одинаковом tok/step —
+линейное масштабирование checkpoint kernel подтверждено.
 
-### Бенчмарк ctx_len × batch × dtype (checkpoint kernel)
+### 138.9M (с compiled_micro)
 
-> Все конфиги 2048 tok/step. Медиана 20 итераций. iogpu=14GB.
+| Конфиг | tok/s | RAM |
+|--------|-------|-----|
+| b=4 ctx=512 accum=4 | **1739** | 12.1G ✅ |
+| b=4 ctx=512 accum=2 | 1711 | 11.8G ✅ |
+| b=2 ctx=1024 accum=2 | 1634 | 11.7G ✅ |
 
-| ctx | batch | dtype | tok/s | RAM | норм |
-|-----|-------|-------|-------|-----|------|
-| 512 | 4 | fp32 | 5295 | 11.8G | 0.78 |
-| **1024** | **2** | **bf16** | **4997** | **10.3G** | **0.58** ← production |
-| 512 | 4 | bf16 | 5841 | 10.5G | 0.77 |
-| 1024 | 2 | fp32 | 4761 | 11.7G | 0.58 |
-| 2048 | 1 | fp32 | 3811 | 11.6G | 0.45 |
-| 2048 | 1 | bf16 | 3941 | 10.4G | 0.44 |
-| 4096 | 1 | fp32 | 3986 | 15.4G | 0.36 ⚠️ |
-| 4096 | 1 | bf16 | 4073 | 15.3G | 0.35 ⚠️ |
+**Потолок 138.9M на M4 Air:** ~2 000 tok/s (8× больше FLOPs чем debug).
+5B токенов при 1739 tok/s = ~33 дня. Нецелесообразно для предобучения.
 
-**Ключевые выводы:**
-- ctx=512/1024/2048 — ОДИНАКОВАЯ память (11.6-11.8G) при одинаковых tok/step → линейное масштабирование подтверждено
-- ctx=4096 = 4096 tok/step (вдвое больше), поэтому и памяти вдвое больше (~15G)
-- bf16 даёт +5-10% скорость и -12% RAM при одинаковом качестве (norm идентична)
+---
 
-### Эволюция реальной скорости обучения
+## Провальные эксперименты
 
-| Момент | Конфиг | tok/s | Что изменилось |
-|--------|--------|-------|----------------|
-| step 83100 | ctx=512 b=4, v2, fp32 | 3 666 | исходное состояние |
-| после фикса утечки | ctx=256 b=8, checkpoint, fp32 | 4 500 | fix mx.eval + checkpoint |
-| overnight run | ctx=256 b=11, checkpoint, fp32 | 4 575 | batch увеличен |
-| **текущий конфиг** | **ctx=1024 b=2, checkpoint, bf16** | **~5000** | **bf16 + длинный ctx** |
+| Эксперимент | Результат | Причина |
+|-------------|-----------|---------|
+| simd_sum backward | 0.93× медленнее | 320 последовательных simd_sum = 1280 циклов |
+| accum[D][D+1] bank padding | 0.93× медленнее | Apple GPU ≠ NVIDIA banking |
+| ANE для matmul | не реализовано | WKV нельзя выразить на ANE без hit лимита |
+| bf16 без dtype cast | crash | cotangent mismatch |
+| tree_map без eval | 28 GB взрыв | lazy граф |
+
+---
+
+## Профилирование (Xcode Instruments Metal System Trace)
+
+| Метрика | Значение |
+|---------|----------|
+| GPU утилизация Python | 77.8% |
+| CPU→GPU latency | 80.72ms |
+| Dispatches (Python) | 6 744 за 58с |
+| CustomKernel (WKV) | **4.4%** работы |
+| Matmul | **22%** работы |
+| Compile fused ops | 23.7% работы |
+
+**Вывод:** WKV = 4.4% → дальнейшая оптимизация WKV бессмысленна.
+Bottleneck: matmul (compute-bound при batch≥4), optimizer bandwidth.
+
+### Арифметическая интенсивность операций
+
+| Операция | FLOPs/byte | Тип |
+|----------|-----------|-----|
+| Проекция (B×T,D)×(D,D) | 204 | compute-bound |
+| FFN (D→4D→D) | ~200 | compute-bound |
+| Head (D→vocab) | 478 | compute-bound |
+| **WKV (sequential)** | **~1** | **bandwidth-bound** ← поэтому Metal помогло |
+
+---
+
+## Apple Neural Engine (ANE) — анализ
+
+| Параметр | Значение | Источник |
+|----------|----------|---------|
+| Реальная производительность | 19 TOPS INT8 | эксперименты |
+| FP16 throughput | ~15.8 TFLOPS | Orion paper |
+| Bandwidth | 60 GB/s | эксперименты |
+| SRAM | ~32 MB | Orion/maderix |
+| Лимит компиляций | 148/фаза | эксперименты |
+| Параллельность с GPU | ДА | эксперименты |
+
+**Почему ANE не помогает для RWKV training:**
+- При ctx=128: GPU compile даёт 0.7ms, ANE для SmolLM 7ms (GPU быстрее!)
+- RWKV линейный по T → GPU с compile уже оптимален
+- WKV recurrence нельзя выразить без разворачивания цикла
+
+**Где ANE полезен:** inference на устройстве (CoreML RWKV для iPhone уже существует,
+0.4B даёт 100 tok/s на iPhone). Для нашего проекта: inference финальной debug модели.
+
+---
+
+## 138.9M Inference
+
+```
+RWKV-7 World3 1.5B (L24-D2048-H32) через mlx-lm:
+  Память: 9.7 → 10.8 GB
+  Скорость: ~25-30 tok/s
+  Токенизатор: RWKV World (65536 токенов), НЕ GPT-2 (50254)
+  Формат промпта: "User: ...\n\nAssistant:"
+```
+
+**Проблемы при загрузке:**
+1. RWKV/RWKV7-Goose-World3-1.5B-HF требует `fla` пакет (нет на PyPI)
+2. tokenizer.json = GPT-2 vocab (50254), неправильный для World модели
+3. Решение: патчить config.json (убрать auto_map), использовать RWKV World tokenizer
+   из `/opt/homebrew/lib/python3.14/site-packages/rwkv/rwkv_vocab_v20230424.txt`
+
+**Для полноценного inference:**
+- Base World модель не следует русским инструкциям
+- Нужна instruction-tuned версия (GooseOne G1c)
+- Или LoRA файнтюн на инструкционных парах
+
+---
+
+## Следующий шаг: LoRA через наш Metal kernel
+
+### Архитектура LoRA для RWKV-7
+
+```
+W_frozen + ΔW = W_frozen + α/r × B × A
+  B: D → rank   (обучаем)
+  A: rank → D   (обучаем)
+  W: заморожен  (gradient.stop_gradient)
+```
+
+**Где ставить адаптеры:**
+- `receptance.weight` (r_proj) → градиент течёт через WKV backward ← наш kernel
+- `key.weight` (k_proj)        → через WKV backward
+- `value.weight` (v_proj)      → через WKV backward
+- `output.weight` (o_proj)     → НЕ через WKV (после WKV)
+- FFN up/gate/down             → НЕ через WKV
+
+**Память для GooseOne 2.9B LoRA (rank=16):**
+- Веса base (bf16): ~5.8 GB
+- LoRA adapter: ~8 MB
+- Optimizer state: ~32 MB (только адаптер!)
+- Итого: ~7-8 GB → влезает без аккумуляции
+
+### Реализация (план)
+
+```python
+class LoRALinear(nn.Module):
+    def __init__(self, linear: nn.Linear, rank: int = 16, alpha: float = 32.0):
+        self.linear = linear   # заморожен
+        self.A = nn.Linear(linear.weight.shape[1], rank, bias=False)
+        self.B = nn.Linear(rank, linear.weight.shape[0], bias=False)
+        self.scale = alpha / rank
+        # Инициализация: A ~ N(0, σ), B = 0 → ΔW = 0 на старте
+        self.A.weight = mx.random.normal(self.A.weight.shape) * 0.02
+        self.B.weight = mx.zeros(self.B.weight.shape)
+
+    def __call__(self, x):
+        return mx.stop_gradient(self.linear(x)) + self.scale * self.B(self.A(x))
+
+def add_lora(model, rank=16, target_modules=('r_proj', 'k_proj', 'v_proj', 'o_proj')):
+    for layer in model.layers:
+        for name in target_modules:
+            if hasattr(layer.attn, name):
+                orig = getattr(layer.attn, name)
+                setattr(layer.attn, name, LoRALinear(orig, rank))
+    return model
+```
+
+**Данные для файнтюна под перефразирование русской литературы:**
+1. Взять 1000 абзацев из своего датасета литературы
+2. Сгенерировать пары через Claude API (~$2-3)
+3. Формат JSONL: `{"instruction": "Перефразируй: ...", "output": "..."}`
+
+---
+
+## Статус компонентов
+
+| Компонент | Статус |
+|-----------|--------|
+| Metal forward kernel | ✅ Production |
+| Metal backward (checkpoint) | ✅ Production, 1.73× vs v2 |
+| Утечка памяти | ✅ Исправлена |
+| bf16 обучение | ✅ Работает |
+| mx.compile | ✅ Работает |
+| Gradient accumulation | ✅ Работает (compiled_micro) |
+| bf16 checkpoints | ✅ Автоматически (save_weights) |
+| simd_sum backward | ❌ 0.93× — медленнее |
+| bank padding | ❌ 0.93× — медленнее |
+| RWKV-7 1.5B inference | ✅ 25-30 tok/s, 10.8 GB |
+| LoRA реализация | ⏳ Следующая сессия |
+| 138.9M предобучение | ⏳ ~33 дня (нецелесообразно) |
+| GooseOne LoRA файнтюн | ⏳ Следующая сессия |
+
+---
+
+## Прогресс обучения debug модели
+
+| Step | Loss | tok/s | Конфиг |
+|------|------|-------|--------|
+| 83100 | 4.9891 | 3 666 | v2, ctx=512, b=4, fp32 |
+| 133200 | 4.8482 | 4 575 | checkpoint, ctx=256, b=11, fp32 |
+| 157050 | 4.5551 | 6 978 | checkpoint+compile+bf16, ctx=1024, b=12 |
+| 157500 | 4.7610 | 5 918 | ctx=1024 b=4 (тест нового конфига) |
 
 ---
 
 ## Правила бенчмарка
 
 ```python
-# Прогреть ОБА ядра вместе (≥10 итераций каждое)
-for _ in range(10):
-    eval(kernel_A); eval(kernel_B)
+# 1. Прогреть ОБА ядра вместе (≥10 итераций каждое)
+for _ in range(10): eval(A); eval(B)
 time.sleep(1)
-
-# Измерять каждую итерацию отдельно
-times = [measure_one_iter(kernel) for _ in range(80)]
-result = statistics.median(times)   # МЕДИАНА, не mean!
+# 2. Медиана, не mean (mean занижает из-за JIT-пауз)
+times = [measure() for _ in range(80)]
+result = statistics.median(times)
 ```
-
-Metal компилирует шейдеры двумя проходами (tier-1 быстрый JIT → tier-2 оптимизация фоном).
-Без совместного прогрева JIT второго ядра попадает в измерение первого → искажение до 1.5×.
-Mean по N прогонам включает JIT-паузы → занижает результат.
-
----
-
-## Потенциальные оптимизации (от простого к сложному)
-
-### 🟢 Низкая сложность
-
-**1. ctx=4096 как основной контекст** _(1-2 часа)_
-При batch=1 bf16 → 4073 tok/s, 15.3G. Требует постоянного iogpu.wired_limit_mb=14336
-через /etc/sysctl.conf. Лучшее качество языкового понимания.
-Риск: нестабильность если фоновые процессы заберут память.
-
-**2. mx.compile на loss_fn** _(2-4 часа)_
-Checkpoint убрал mx.eval из Python-цикла. Теперь единственный eval — в VJP.
-mx.compile совместим с mx.custom_function (проверено). Потенциал: +15-30% на
-non-WKV операциях (LayerNorm, проекции, softmax через graph fusion).
-Блокер: mx.eval внутри VJP может помешать компиляции — нужно проверить.
-
-**3. Сохранение/загрузка чекпоинта в bf16** _(1 час)_
-Текущий код сохраняет в fp32. Если сохранять в bf16 → в 2× меньше размер файлов.
-При загрузке конвертировать обратно в bf16.
-
-### 🟡 Средняя сложность
-
-**4. Увеличенный batch для ctx=1024** _(3-5 часов)_
-ctx=1024 использует 11.7G при batch=2. До 14G влезет batch=3 (оценка ~13.5G).
-Проверить: `ctx=1024 batch=3 bf16` — ожидается ~6000-6500 tok/s.
-Требует бенчмарка и проверки стабильности памяти.
-
-**5. Gradient checkpointing для модели** _(5-10 часов)_
-MLX не имеет встроенного gradient checkpointing для слоёв. Можно реализовать через
-mx.custom_function вручную для самых дорогих операций (head projection, 6 TMix блоков).
-Потенциал: -30-40% пиковой памяти при обратном проходе → можно увеличить batch.
-Риск: +30-50% времени backward (нужна повторная вычисление активаций).
-
-**6. Xcode GPU Frame Capture профилирование** _(2-4 часа)_
-Единственный способ точно понять:
-- Реальное распределение времени по Metal kernels
-- Занятость threadgroup памяти
-- Почему bank padding не помог (увидим реальную банковую схему Apple GPU)
-- Какие операции занимают больше всего
-Инструмент: Xcode → Debug → Capture GPU Frame.
-
-**7. LoRA файнтюн GooseOne 2.9B** _(1 день)_
-Модель уже поддерживается в mlx-lm (PR #580 @MollySophia).
-```bash
-pip install mlx-lm
-mlx_lm.lora --model MollySophia/GooseOne-2.9B ...
-```
-Требует: скачать модель (~6GB), подготовить датасет, настроить LoRA параметры.
-
-### 🔴 Высокая сложность
-
-**8. mx.compile совместимый WKV (mx.scan)** _(1-2 недели)_
-mx.scan в MLX 0.31.2 отсутствует. Альтернативы:
-a) Дождаться mx.scan в будущих версиях MLX
-b) Реализовать собственный scan через mx.custom_function с кастомным VJP
-c) Убрать mx.eval из VJP через "deferred eval" паттерн
-
-Разблокирует mx.compile для всего loss_fn → потенциально +30-50% реального обучения.
-Самая высокая отдача, самая сложная реализация.
-
-**9. Оптимизация accum column-sum паттерна** _(1-2 недели)_
-Текущий backward: 12 threadgroup_barrier на timestep.
-accum[D][D] column-sum: каждый поток читает 64 элемента из одного столбца.
-Возможные улучшения:
-- simdgroup_matrix (AMX) для column-sum: hardware matrix multiply заменяет ручные петли
-- Transpose accum в регистры через simd_shuffle_xor
-- Слияние фаз dw+da и dk+db в одном accum-проходе (нужны 2 отдельных D×D буфера = 32KB)
-  При 128 reg/thread доступно 32KB → теоретически возможно.
-Ожидаемый прирост: 1.3-2.0× backward kernel в изоляции.
-
-**10. Custom Metal kernel для head (D→vocab)** _(2-3 недели)_
-head projection D=384→V=32000 — самый дорогой matmul в модели.
-MLX использует общий GEMM. Специализированный kernel с tile размером под M4 GPU,
-BF16 accumulation и fused cross-entropy мог бы дать 1.5-2× на head операции.
-Сложность: нужны глубокие знания Metal Performance Shaders и GEMM тюнинга.
-
-**11. 100M/300M модель** _(несколько дней)_
-n_embd=768/1024, n_layer=12/24, ctx=4096.
-100M: ~8-10 GB, требует iogpu расширения.
-300M: ~14-15 GB при batch=1 bf16 — на пределе возможного на 16GB машине.
-Предварительный шаг: mx.compile (пункт 8) для экономии памяти на активациях.
-
----
-
-## Текущий статус всего проекта
-
-| Компонент | Статус |
-|-----------|--------|
-| Metal forward kernel | ✅ Production |
-| Metal backward (checkpoint) | ✅ Production, 1.73× vs v2 |
-| Утечка памяти (20 GB) | ✅ Исправлена |
-| bf16 обучение | ✅ Работает, +5-10% скорость |
-| Оптимальный конфиг (ctx=1024 b=2 bf16) | ✅ Установлен |
-| simd_sum backward | ❌ 0.93× — медленнее v2 |
-| bank padding (accum[D+1]) | ❌ 0.93× — медленнее v2 |
-| mx.compile на loss_fn | ⏳ Не тестировалось с checkpoint |
-| ctx=4096 обучение | ⏳ Работает но нужен wired limit |
-| mx.scan / compile-compatible WKV | ⏳ mx.scan отсутствует в 0.31.2 |
-| 100M/300M модель | ⏳ После mx.compile |
-| LoRA файнтюн GooseOne 2.9B | ⏳ Низкий приоритет |
-
----
-
-## Прогресс обучения debug модели
-
-- **step 83100:** loss 4.9891, 3666 tok/s (v2, ctx=512, b=4, fp32)
-- **step 133200:** loss 4.8482, 4575 tok/s (checkpoint, ctx=256, b=11, fp32)
-- **текущий конфиг:** ctx=1024, b=2, bf16, ~5000 tok/s, ~10.3 GB
-
----
-
-## mx.compile интеграция (29 мая 2026)
-
-### Что сделано
-
-**Убран `mx.eval` из VJP** `wkv7_checkpoint.py`:
-```python
-# Было:
-mx.eval(h_ckpts, sa_fwd, d_out, d_h_out)  # запрещено внутри compile
-res = _get_ckpt_bwd(H, T)(...)
-# Стало:
-res = _get_ckpt_bwd(H, T)(...)  # Metal kernel сам материализует lazy inputs
-```
-
-**`train_step` заменён на `make_train_step(model, optimizer)`**:
-```python
-def make_train_step(model, optimizer):
-    state = [model.state, optimizer.state]
-    def _step(x, y):
-        loss, grads = mx.value_and_grad(loss_fn)(model, x, y)
-        grads, norm = optim.clip_grad_norm(grads, max_norm=1.0)
-        optimizer.update(model, grads)
-        return loss, norm
-    return mx.compile(_step, inputs=state, outputs=state)
-```
-
-`mx.eval(model.state, optimizer.state)` убран из шага — `compile` управляет state сам.
-Утечки памяти нет: `inputs/outputs=state` гарантирует правильное обновление весов.
-
-### Результаты
-
-```
-normal (checkpoint + bf16):   6044 tok/s
-compiled (checkpoint + bf16): 6773 tok/s
-Ускорение: 1.12×   Корректность: loss diff = 0.0000 ✓
-```
-
-### Полная эволюция скорости
-
-| Версия | tok/s | Что добавлено |
-|--------|-------|---------------|
-| Python chunked, fp32 | ~900 | исходное |
-| v2 Metal backward, fp32 | 3 666 | Metal backward |
-| checkpoint kernel, fp32 | 4 500-5 000 | нет Python-loop |
-| checkpoint + bf16 | 5 800-6 050 | bf16 модель |
-| **checkpoint + bf16 + compile** | **~6 750** | **mx.compile** |
-
-**Итоговое ускорение vs Python: ~7.5×**
-
-### Текущая конфигурация production
-
-```python
-# config.py
-"debug": ctx_len=1024, batch_size=4
-
-# train.py  
-MODEL_DTYPE = mx.bfloat16
-train_step  = make_train_step(model, optimizer)  # mx.compile
-```
-
-Скорость: **~6750 tok/s**, RAM: **~10 GB**, контекст: **1024 токена**.
-
-
----
-
-## Xcode Instruments профилирование (29 мая 2026)
-
-### Metal System Trace — результаты
-
-**GPU утилизация Python-процесса: 77.8%** (45.14s из 58.01s)
-Compute dispatches: 6,744 за 58с = ~116/с = ~70 dispatch/step (нормально для 6-слойной модели)
-
-**Критическая метрика: CPU→GPU latency = 80.72ms**
-Среднее время от CPU-команды до начала GPU-исполнения.
-Это означает что GPU периодически "простаивает" ожидая следующую порцию работы от CPU.
-Несмотря на mx.compile, Python-overhead между dispatch'ами ещё присутствует.
-
-**GPU Performance State: преимущественно P2 (средняя частота)**
-GPU снижает частоту в паузах между dispatch'ами — прямое следствие высокой latency.
-
-### Распределение работы (из Allocations/Time Profiler)
-
-| Операция | % | Вывод |
-|---|---|---|
-| Compiled (mx.compile fused) | 23.7% | наши fused операции |
-| **Matmul** | **21.9%** | **проекции r/k/v/o, FFN, head** |
-| Softmax | 10.4% | cross-entropy fwd+bwd |
-| **CustomKernel (WKV!)** | **4.4%** | наш wkv7_ckpt kernel |
-| LayerNorm + VJP | 3.2% | нормализации |
-
-### Ключевые выводы
-
-1. **WKV = 4.4% работы** — дальнейшая оптимизация WKV kernel даст <5% прироста.
-   Все усилия на WKV уже окупились, дальше не стоит.
-
-2. **Matmul = 21.9%** — это проекции r/k/v/o (4×D²×6слоёв), FFN (D→4D→D×6слоёв),
-   head (D→32000). Для ускорения нужен либо более быстрый GEMM (невозможно без Apple MPS),
-   либо уменьшение числа операций (квантование, structured pruning).
-
-3. **CPU→GPU latency 80ms** — основная проблема. GPU ждёт CPU.
-   Причина: mx.compile не устранил все Python-overhead, dispatch-loop ещё есть.
-   Решение: увеличить batch (больше работы на каждый dispatch) или дальнейший compile.
-
-4. **P2 вместо P1 GPU state** — следствие пункта 3. При постоянной нагрузке GPU
-   поднялся бы до P1 (максимум). Пауза → снижение тактовой.
-
-### Следующий шаг для снижения latency
-Увеличить batch_size: больше токенов → больше работы на один GPU dispatch →
-GPU держит P1 → меньше латентность → выше throughput.
-Проверить: ctx=1024 batch=5 bf16 (оценка ~13GB, вблизи лимита).
-
-
----
-
-## 138.9M модель — тестирование и результаты (29 мая 2026)
-
-### Реальный размер "100M" конфига
-
-```python
-RWKVConfig(n_layer=12, n_embd=768, vocab_size=32000, ctx_len=1024, batch_size=4)
-```
-Параметров: **138.9M** (не 100M — vocab embedding даёт значительный вклад)
-n_head = 768/64 = **12 голов** (против 4 у debug)
-
-### Что изменилось vs debug (36.4M)
-
-| | debug 36.4M | 138.9M |
-|---|---|---|
-| FLOPs на токен | baseline | ~8× больше |
-| Optimizer state (fp32) | 291MB | **1.1GB** |
-| Градиенты (fp32) | 145MB | **556MB** |
-| Веса (bf16) | 73MB | 278MB |
-| n_head для WKV | 4 | 12 |
-
-### Почему accum=1 → OOM, accum>1 → OK
-
-Без аккумуляции backward держит активации всех 12 слоёв одновременно:
-12 × 2 × B×T×768×2B = огромный объём. С аккумуляцией каждый микро-шаг
-меньше → вписывается.
-
-### compiled_micro: ключевая оптимизация аккумуляции
-
-**Проблема:** при grad_accum>1 исходный код использовал некомпилированный
-`value_and_grad` → нет kernel fusion → медленно.
-
-**Фикс:** компилируем микро-шаг с `inputs=model.state`:
-```python
-micro_state = [model.state]
-def _micro_fn(x, y):
-    return mx.value_and_grad(loss_fn)(model, x, y)
-compiled_micro = mx.compile(_micro_fn, inputs=micro_state)
-```
-Веса не меняются между микро-шагами → compile трактует их как константы.
-Результат: +12% скорости при аккумуляции.
-
-### Память: почему спайки на Activity Monitor
-
-Каждый `mx.eval(grads_i)` материализует 556MB градиентов:
-- Пик: grads_1 + grads_2 оба в памяти = +1.1GB кратковременно
-- У debug: 145MB — почти незаметно на графике
-- Ритмичные пики = fingerprint gradient accumulation
-
-### Бенчмарки 138.9M (compiled_micro, bf16, M4 Air 16GB)
-
-| Конфиг | tok/s | RAM | Эфф. tok/step |
-|---|---|---|---|
-| b=4 ctx=512 accum=4 | **1739** | 12.1GB ✅ | 16 384 |
-| b=4 ctx=512 accum=2 | 1711 | 11.8GB ✅ | 8 192 |
-| b=2 ctx=1024 accum=2 | 1634 | 11.7GB ✅ | 8 192 |
-| b=6 ctx=512 accum=2 | 1602 | 13.2GB ✅ | 12 288 |
-
-**Рекомендуемый конфиг:** `b=4 ctx=512 accum=4` → 1739 tok/s, 12.1GB
-
-### Почему 1739 tok/s — реальный потолок на M4 Air
-
-1. **FLOPs**: 8× больше чем debug → ~4× медленнее на тех же токенах
-2. **Optimizer bandwidth**: 1.1GB Adam state = 1.1GB записи каждый шаг
-3. **Grad accumulation overhead**: 2-4 отдельных forward+backward вместо одного compile
-4. **Compile частично помогает** через compiled_micro, но аккумуляция остаётся узким местом
-
-### Масштаб обучения
-
-При 1739 tok/s:
-- 1 миллиард токенов: ~8 дней непрерывно
-- 5 миллиардов токенов (минимум для приличной модели): ~33 дня
-
-Вывод: **предобучение 138.9M с нуля на M4 Air нецелесообразно**.
-Реалистичные альтернативы:
-- LoRA файнтюн готовой GooseOne 2.9B через mlx-lm
-- Обучение debug (36.4M) как proof-of-concept
-- Аренда A100 для 138.9M+ предобучения
-
----
-
-## Полный стек оптимизаций (финальный итог)
-
-### debug 36.4M: эволюция скорости
-
-| Этап | tok/s | Что добавлено |
-|---|---|---|
-| Python einsum baseline | ~900 | исходное |
-| Metal v2 chunked backward | 3 666 | custom Metal VJP |
-| Checkpoint kernel (2 вызова на T) | ~5 000 | нет Python-цикла |
-| + bf16 модель | ~6 050 | kernel fusion bf16 |
-| + mx.compile (1 шаг) | 6 720 | kernel fusion compile |
-| + batch=12 (стало возможно с compile) | **6 978** | 2.8× меньше памяти |
-| **Итого vs Python: 7.8×** | | |
-
-### 138.9M: оптимальный конфиг
-
-```python
-# config.py
-"100M": RWKVConfig(n_layer=12, n_embd=768, vocab_size=32000,
-                   ctx_len=512, batch_size=4)
-# train.py
-MODEL_DTYPE = mx.bfloat16
-GRAD_ACCUM  = 4     # эфф. batch = 16384 tok/step
-CFG_NAME    = "100M"
-```
-
-### Потенциальные техники для ускорения 138.9M (не реализованы)
-
-1. **8-bit AdamW** — optimizer state 1.1GB → 275MB (-75%). Нет в MLX, нужна кастомная реализация. Разблокирует batch=2-3 без аккумуляции.
-2. **Gradient checkpointing слоёв** — перевычислять активации при backward вместо хранения. -40% активационной памяти, +30% времени. В MLX нет встроенного.
-3. **Накопление в bf16** — хранить accumulated_grads в bf16 (-2× RAM для аккум. буфера). Риск потери точности при многих шагах.
-
