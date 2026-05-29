@@ -429,3 +429,118 @@ GPU снижает частоту в паузах между dispatch'ами —
 GPU держит P1 → меньше латентность → выше throughput.
 Проверить: ctx=1024 batch=5 bf16 (оценка ~13GB, вблизи лимита).
 
+
+---
+
+## 138.9M модель — тестирование и результаты (29 мая 2026)
+
+### Реальный размер "100M" конфига
+
+```python
+RWKVConfig(n_layer=12, n_embd=768, vocab_size=32000, ctx_len=1024, batch_size=4)
+```
+Параметров: **138.9M** (не 100M — vocab embedding даёт значительный вклад)
+n_head = 768/64 = **12 голов** (против 4 у debug)
+
+### Что изменилось vs debug (36.4M)
+
+| | debug 36.4M | 138.9M |
+|---|---|---|
+| FLOPs на токен | baseline | ~8× больше |
+| Optimizer state (fp32) | 291MB | **1.1GB** |
+| Градиенты (fp32) | 145MB | **556MB** |
+| Веса (bf16) | 73MB | 278MB |
+| n_head для WKV | 4 | 12 |
+
+### Почему accum=1 → OOM, accum>1 → OK
+
+Без аккумуляции backward держит активации всех 12 слоёв одновременно:
+12 × 2 × B×T×768×2B = огромный объём. С аккумуляцией каждый микро-шаг
+меньше → вписывается.
+
+### compiled_micro: ключевая оптимизация аккумуляции
+
+**Проблема:** при grad_accum>1 исходный код использовал некомпилированный
+`value_and_grad` → нет kernel fusion → медленно.
+
+**Фикс:** компилируем микро-шаг с `inputs=model.state`:
+```python
+micro_state = [model.state]
+def _micro_fn(x, y):
+    return mx.value_and_grad(loss_fn)(model, x, y)
+compiled_micro = mx.compile(_micro_fn, inputs=micro_state)
+```
+Веса не меняются между микро-шагами → compile трактует их как константы.
+Результат: +12% скорости при аккумуляции.
+
+### Память: почему спайки на Activity Monitor
+
+Каждый `mx.eval(grads_i)` материализует 556MB градиентов:
+- Пик: grads_1 + grads_2 оба в памяти = +1.1GB кратковременно
+- У debug: 145MB — почти незаметно на графике
+- Ритмичные пики = fingerprint gradient accumulation
+
+### Бенчмарки 138.9M (compiled_micro, bf16, M4 Air 16GB)
+
+| Конфиг | tok/s | RAM | Эфф. tok/step |
+|---|---|---|---|
+| b=4 ctx=512 accum=4 | **1739** | 12.1GB ✅ | 16 384 |
+| b=4 ctx=512 accum=2 | 1711 | 11.8GB ✅ | 8 192 |
+| b=2 ctx=1024 accum=2 | 1634 | 11.7GB ✅ | 8 192 |
+| b=6 ctx=512 accum=2 | 1602 | 13.2GB ✅ | 12 288 |
+
+**Рекомендуемый конфиг:** `b=4 ctx=512 accum=4` → 1739 tok/s, 12.1GB
+
+### Почему 1739 tok/s — реальный потолок на M4 Air
+
+1. **FLOPs**: 8× больше чем debug → ~4× медленнее на тех же токенах
+2. **Optimizer bandwidth**: 1.1GB Adam state = 1.1GB записи каждый шаг
+3. **Grad accumulation overhead**: 2-4 отдельных forward+backward вместо одного compile
+4. **Compile частично помогает** через compiled_micro, но аккумуляция остаётся узким местом
+
+### Масштаб обучения
+
+При 1739 tok/s:
+- 1 миллиард токенов: ~8 дней непрерывно
+- 5 миллиардов токенов (минимум для приличной модели): ~33 дня
+
+Вывод: **предобучение 138.9M с нуля на M4 Air нецелесообразно**.
+Реалистичные альтернативы:
+- LoRA файнтюн готовой GooseOne 2.9B через mlx-lm
+- Обучение debug (36.4M) как proof-of-concept
+- Аренда A100 для 138.9M+ предобучения
+
+---
+
+## Полный стек оптимизаций (финальный итог)
+
+### debug 36.4M: эволюция скорости
+
+| Этап | tok/s | Что добавлено |
+|---|---|---|
+| Python einsum baseline | ~900 | исходное |
+| Metal v2 chunked backward | 3 666 | custom Metal VJP |
+| Checkpoint kernel (2 вызова на T) | ~5 000 | нет Python-цикла |
+| + bf16 модель | ~6 050 | kernel fusion bf16 |
+| + mx.compile (1 шаг) | 6 720 | kernel fusion compile |
+| + batch=12 (стало возможно с compile) | **6 978** | 2.8× меньше памяти |
+| **Итого vs Python: 7.8×** | | |
+
+### 138.9M: оптимальный конфиг
+
+```python
+# config.py
+"100M": RWKVConfig(n_layer=12, n_embd=768, vocab_size=32000,
+                   ctx_len=512, batch_size=4)
+# train.py
+MODEL_DTYPE = mx.bfloat16
+GRAD_ACCUM  = 4     # эфф. batch = 16384 tok/step
+CFG_NAME    = "100M"
+```
+
+### Потенциальные техники для ускорения 138.9M (не реализованы)
+
+1. **8-bit AdamW** — optimizer state 1.1GB → 275MB (-75%). Нет в MLX, нужна кастомная реализация. Разблокирует batch=2-3 без аккумуляции.
+2. **Gradient checkpointing слоёв** — перевычислять активации при backward вместо хранения. -40% активационной памяти, +30% времени. В MLX нет встроенного.
+3. **Накопление в bf16** — хранить accumulated_grads в bf16 (-2× RAM для аккум. буфера). Риск потери точности при многих шагах.
+
